@@ -27,25 +27,37 @@ jobs:
           distribution: temurin
           java-version: '17'
 
-      - name: Install common packages (wget/unzip/gradle/rsync)
+      - name: Install common packages (wget/unzip/git/rsync)
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y wget unzip git ca-certificates apt-transport-https gnupg rsync
-          # install a system gradle so we can generate a wrapper if needed
-          sudo apt-get install -y gradle
+        shell: bash
+
+      - name: Install Gradle CLI 8.0.2 (for wrapper generation)
+        run: |
+          set -euo pipefail
+          GRADLE_VERSION=8.0.2
+          GRADLE_DIR="$RUNNER_TEMP/gradle"
+          mkdir -p "$GRADLE_DIR"
+          wget -q "https://services.gradle.org/distributions/gradle-${GRADLE_VERSION}-bin.zip" -O gradle.zip
+          unzip -q gradle.zip -d "$GRADLE_DIR"
+          echo "$GRADLE_DIR/gradle-${GRADLE_VERSION}/bin" >> $GITHUB_PATH
+          rm -f gradle.zip
         shell: bash
 
       - name: Install Android commandline tools and SDK packages
         run: |
-          # use runner temp for SDK
           ANDROID_SDK_ROOT="$RUNNER_TEMP/android-sdk"
           mkdir -p "$ANDROID_SDK_ROOT/cmdline-tools"
           wget -q https://dl.google.com/android/repository/commandlinetools-linux-9477386_latest.zip -O cmdline.zip
           unzip -q cmdline.zip -d "$ANDROID_SDK_ROOT/cmdline-tools"
           mkdir -p "$ANDROID_SDK_ROOT/cmdline-tools/latest"
           mv "$ANDROID_SDK_ROOT/cmdline-tools/cmdline-tools/"* "$ANDROID_SDK_ROOT/cmdline-tools/latest/" || true
-          export PATH="$ANDROID_SDK_ROOT/cmdline-tools/latest/bin:$PATH"
+          # expose sdkmanager and platform-tools to following steps
+          echo "$ANDROID_SDK_ROOT/cmdline-tools/latest/bin" >> $GITHUB_PATH
+          echo "$ANDROID_SDK_ROOT/platform-tools" >> $GITHUB_PATH
           yes | "$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager" --sdk_root="$ANDROID_SDK_ROOT" "platform-tools" "platforms;android-33" "build-tools;33.0.2" || true
+          yes | "$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager" --sdk_root="$ANDROID_SDK_ROOT" --licenses || true
           echo "ANDROID_SDK_ROOT=$ANDROID_SDK_ROOT" >> $GITHUB_ENV
           echo "ANDROID_HOME=$ANDROID_SDK_ROOT" >> $GITHUB_ENV
         shell: bash
@@ -54,7 +66,6 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p extracted
-          # enable nullglob so that the *.zip expands to empty array when no matches
           shopt -s nullglob || true
           zips=( *.zip )
           if [ "${#zips[@]}" -gt 0 ]; then
@@ -64,7 +75,6 @@ jobs:
               unzip -o "$z" -d extracted
             done
             echo "Merging extracted contents into repo root (preserving .git)"
-            # copy extracted content into repo root, overwrite files but keep .git
             rsync -a --exclude '.git' extracted/ ./
             ls -la
           else
@@ -72,13 +82,22 @@ jobs:
           fi
         shell: bash
 
+      - name: Cache Gradle packages
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: ${{ runner.os }}-gradle-${{ hashFiles('**/gradle-wrapper.properties') }}
+          restore-keys: |
+            ${{ runner.os }}-gradle-
+
       - name: Ensure Gradle wrapper exists (generate if placeholder or missing)
         run: |
           set -euo pipefail
-          # If gradlew is missing or the placeholder message is present, generate the wrapper using system gradle
+          # Ensure the downloaded Gradle CLI (8.0.2) is used for wrapper generation
           if [ ! -f ./gradlew ] || grep -q "placeholder gradlew" ./gradlew 2>/dev/null || grep -q "placeholder gradlew" ./gradlew.bat 2>/dev/null; then
-            echo "Gradle wrapper missing or placeholder detected — generating wrapper with system gradle"
-            # system gradle should be installed in earlier step
+            echo "Gradle wrapper missing or placeholder detected — generating wrapper with downloaded gradle"
             gradle wrapper --gradle-version 8.0.2
             chmod +x ./gradlew || true
           else
@@ -95,3 +114,10 @@ jobs:
           export TERM=dumb
           ./gradlew assembleDebug --no-daemon
         shell: bash
+
+      - name: Upload APK artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-debug-apk
+          path: app/build/outputs/**/*.apk
